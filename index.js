@@ -6,7 +6,7 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { connect } = require('./db'); // must export connect(uri, dbName)
 const { ObjectId } = require('mongodb');
-const { generateSearchParams, generateTool } = require('./gemini'); // user-provided gemini.js style
+const { generateSearchParams, generateTool } = require('./gemini'); // your gemini helper
 const { verifyToken } = require('./middleware'); // must export verifyToken(req,res,next)
 
 const app = express();
@@ -69,20 +69,7 @@ async function main() {
   // Basic test route
   app.get('/test', (req, res) => res.json({ message: 'Hello world' }));
 
-  // Debug routes
-  app.get('/ping', (req, res) => res.json({ server: process.env.HOSTNAME || 'local', time: new Date().toISOString() }));
-
-  app.get('/debug/users', async (req, res) => {
-    try {
-      const users = await db.collection('users').find({}).toArray();
-      res.json({ count: users.length, users });
-    } catch (err) {
-      console.error('GET /debug/users error:', err);
-      res.status(500).json({ error: 'Failed to list users' });
-    }
-  });
-
-  // AUTH
+  // AUTH: register
   app.post('/users', async (req, res) => {
     try {
       const { email, password } = req.body;
@@ -94,7 +81,6 @@ async function main() {
       const passwordHash = await bcrypt.hash(password, 12);
       const result = await db.collection('users').insertOne({ email, password: passwordHash });
 
-      console.log('Inserted userId:', result.insertedId.toString());
       res.status(201).json({ message: 'User registered successfully', userId: result.insertedId });
     } catch (error) {
       console.error('POST /users error:', error);
@@ -102,6 +88,7 @@ async function main() {
     }
   });
 
+  // AUTH: login
   app.post('/login', async (req, res) => {
     try {
       const { email, password } = req.body;
@@ -119,7 +106,7 @@ async function main() {
     }
   });
 
-  // GET tools (public) - beginner friendly tags handling
+  // GET tools (public)
   app.get('/tools', async (req, res) => {
     try {
       const { name, category, rack, status, tags } = req.query;
@@ -142,7 +129,6 @@ async function main() {
         }
       }
 
-      console.log('GET /tools criteria:', JSON.stringify(criteria, (k, v) => (v instanceof RegExp ? v.toString() : v)));
       const tools = await db.collection('tools').find(criteria).project({
         name: 1, category: 1, quantity: 1, rack: 1, status: 1, purchaseDate: 1, tags: 1
       }).toArray();
@@ -214,44 +200,67 @@ async function main() {
       const allRacks = await db.collection('tools').distinct('rack');
       const allStatuses = await db.collection('tools').distinct('status');
 
-      // call the user's gemini helper (same style as provided)
+      // call the gemini helper
       const searchParams = await generateSearchParams(query, allCategories, allRacks, allStatuses);
       console.log('AI searchParams:', searchParams);
 
       const criteria = {};
 
-      // If AI returned explicit toolNames (preferred), use them
-      if (searchParams.toolNames && Array.isArray(searchParams.toolNames) && searchParams.toolNames.length) {
+      // 1) If AI returned explicit toolNames -> strict match
+      if (Array.isArray(searchParams.toolNames) && searchParams.toolNames.length) {
         const escape = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        criteria['name'] = { $in: searchParams.toolNames.map(t => new RegExp('^\\s*' + escape(t) + '\\s*$', 'i')) };
+        criteria.name = { $in: searchParams.toolNames.map(t => new RegExp('^\\s*' + escape(t) + '\\s*$', 'i')) };
+      } else if (searchParams.requestedParameters && searchParams.requestedParameters.length) {
+        // 2) If user asked for parameters but no toolNames, try best single match by keyword
+        const knownTools = await db.collection('tools').distinct('name');
+        const qLower = query.toLowerCase();
+        const matched = knownTools.find(t => qLower.includes(t.toLowerCase()));
+        if (matched) {
+          const escape = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          criteria.name = { $regex: '^\\s*' + escape(matched) + '\\s*$', $options: 'i' };
+        } else {
+          // no confident match -> return empty result with message
+          return res.json({
+            tools: [],
+            message: 'Request could not be fulfilled'
+          });
+        }
       } else {
-        // fallback to categories/racks/statuses if provided
-        if (searchParams.categories && searchParams.categories.length) {
-          criteria['category'] = { $in: searchParams.categories };
-        }
-        if (searchParams.racks && searchParams.racks.length) {
-          criteria['rack'] = { $in: searchParams.racks };
-        }
-        if (searchParams.statuses && searchParams.statuses.length) {
-          criteria['status'] = { $in: searchParams.statuses };
-        }
-
-        // If AI returned nothing useful, try a simple keyword match against tool names
-        if ((!searchParams.categories || !searchParams.categories.length)
-          && (!searchParams.racks || !searchParams.racks.length)
-          && (!searchParams.statuses || !searchParams.statuses.length)) {
-          const knownTools = await db.collection('tools').distinct('name');
-          const qLower = query.toLowerCase();
-          const matched = knownTools.find(t => qLower.includes(t.toLowerCase()));
-          if (matched) {
-            const escape = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            criteria['name'] = { $regex: '^\\s*' + escape(matched) + '\\s*$', $options: 'i' };
-          }
-        }
+        // 3) broad intent -> use categories/racks/statuses
+        if (searchParams.categories && searchParams.categories.length) criteria.category = { $in: searchParams.categories };
+        if (searchParams.racks && searchParams.racks.length) criteria.rack = { $in: searchParams.racks };
+        if (searchParams.statuses && searchParams.statuses.length) criteria.status = { $in: searchParams.statuses };
       }
 
-      console.log('AI /ai/tools criteria:', JSON.stringify(criteria));
-      const tools = await db.collection('tools').find(criteria).toArray();
+      // Build projection if requestedParameters present (map common params to fields)
+      const projection = {};
+      if (searchParams.requestedParameters && searchParams.requestedParameters.length) {
+        // always include name
+        projection.name = 1;
+        searchParams.requestedParameters.forEach(p => {
+          const param = p.toLowerCase();
+          if (param === 'model') projection.model = 1;
+          else if (param === 'brand') projection.brand = 1;
+          else if (param === 'specifications' || param === 'weight' || param === 'batterycapacity' || param === 'voltage') {
+            projection.specifications = 1;
+          } else {
+            // default: include specifications so unknown params can be inspected
+            projection.specifications = 1;
+          }
+        });
+      }
+
+      const tools = await db.collection('tools').find(criteria).project(Object.keys(projection).length ? projection : {}).toArray();
+
+      // If no match in DB, return empty array with message as requested
+      if (!tools || tools.length === 0) {
+        return res.json({
+          tools: [],
+          message: 'Request could not be fulfilled'
+        });
+      }
+
+      // Success
       res.json({ tools });
     } catch (error) {
       console.error('GET /ai/tools error:', error);
@@ -276,7 +285,7 @@ async function main() {
       if (!categoryDoc) return res.status(404).json({ error: "AI used a category that doesn't exist" });
 
       newTool.category = categoryDoc;
-      const tagDocs = await db.collection('tags').find({ name: { $in: newTool.tags } }).toArray();
+      const tagDocs = await db.collection('tags').find({ name: { $in: newTool.tags || [] } }).toArray();
       newTool.tags = tagDocs;
 
       const result = await db.collection('tools').insertOne(newTool);
@@ -293,7 +302,7 @@ async function main() {
   });
 }
 
-// Start server after main() completes (keeps simple style)
+// Start server after main() completes
 main()
   .then(() => {
     app.listen(process.env.PORT || 4000, () => {
