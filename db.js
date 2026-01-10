@@ -19,7 +19,7 @@ async function connect(uri = process.env.MONGO_URI, dbname = 'tools_inventory') 
     await client.connect();
     db = client.db(dbname);
 
-    console.log("✅ Successfully connected to MongoDB");
+    console.log("Successfully connected to MongoDB");
     return db;
   } catch (error) {
     console.error("MongoDB connection failed:", error.message);
