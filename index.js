@@ -1,4 +1,3 @@
-// index.js
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -7,7 +6,6 @@ const jwt = require('jsonwebtoken');
 const { connect } = require('./db'); // must export connect(uri, dbName)
 const { ObjectId } = require('mongodb');
 const { generateSearchParams, generateTool } = require('./gemini'); // your gemini helper
-const { verifyToken } = require('./middleware'); // must export verifyToken(req,res,next)
 
 const app = express();
 
@@ -25,39 +23,102 @@ app.use(express.json());
 const mongoUri = process.env.MONGO_URI;
 const dbName = process.env.DB_NAME || 'tools_inventory';
 
-// Helper: generate JWT
+// Helper: generate JWT (ensure user id is string)
 function generateAccessToken(userId, email) {
   return jwt.sign(
-    { user_id: userId, email },
+    { user_id: String(userId), email },
     process.env.JWT_SECRET,
-    { expiresIn: '1h' }
+    { expiresIn: '3d' }
   );
 }
 
-// Validation helper for tools (expects tags to be array of tag names)
+/**
+ * validateTool - Validates and normalizes tool data to match DB structure
+ * - Accepts aliases: specs/specification -> specifications
+ * - Auto-creates missing categories and tags
+ * - Returns { success: false, error, ... } or { success: true, newTool, error: null }
+ */
 async function validateTool(db, request) {
-  const { name, category, quantity, rack, status, purchaseDate, tags } = request;
+  const {
+    name,
+    category,
+    brand,
+    model,
+    purchaseDate,
+    quantity,
+    location,
+    specifications,
+    specs,
+    specification,
+    maintenance,
+    tags,
+    description,
+    status
+  } = request || {};
 
-  if (!name || !category || !quantity || !rack || !status || !purchaseDate || !tags) {
-    return { success: false, error: 'Missing fields' };
+  // Handle field aliases: specifications is the canonical field
+  const effectiveSpecs = specifications || specs || specification;
+
+  // Collect missing fields
+  const missing = [];
+  if (!name) missing.push('name');
+  if (!category) missing.push('category');
+  if (!brand) missing.push('brand');
+  if (!model) missing.push('model');
+  if (purchaseDate === undefined || purchaseDate === null || purchaseDate === '') missing.push('purchaseDate');
+  if (quantity === undefined || quantity === null) missing.push('quantity');
+  if (!location) missing.push('location');
+  if (!effectiveSpecs) missing.push('specifications');
+  if (!Array.isArray(tags) || tags.length === 0) missing.push('tags');
+
+  if (missing.length) {
+    return { success: false, error: 'Missing fields', missing };
   }
 
-  const categoryDoc = await db.collection('categories').findOne({ name: category });
-  if (!categoryDoc) return { success: false, error: 'Invalid category' };
+  // Validate category (stored as string)
+  const categoryName = (category || '').toString().trim();
+  if (!categoryName) return { success: false, error: 'Invalid category' };
 
-  // Expect tags to be array of names; find matching tag docs
-  const tagDocs = await db.collection('tags').find({ name: { $in: tags } }).toArray();
-  if (tagDocs.length !== tags.length) return { success: false, error: 'One or more tags is invalid' };
+  // Auto-create category if it doesn't exist
+  const categoryExists = await db.collection('categories').findOne({ name: categoryName });
+  if (!categoryExists) {
+    await db.collection('categories').insertOne({ name: categoryName, createdAt: new Date() });
+  }
 
+  // Validate tags (stored as string array)
+  const tagNames = tags.map(t => (t || '').toString().trim()).filter(Boolean);
+  const existingTags = await db.collection('tags').find({ name: { $in: tagNames } }).toArray();
+  const existingNames = existingTags.map(t => t.name);
+  const toCreate = tagNames.filter(n => !existingNames.includes(n));
+
+  if (toCreate.length) {
+    const inserts = toCreate.map(n => ({ name: n, createdAt: new Date() }));
+    try {
+      await db.collection('tags').insertMany(inserts, { ordered: false });
+    } catch (err) {
+      if (!err.code || err.code !== 11000) {
+        console.error('insertMany tags error:', err);
+        return { success: false, error: 'Failed to create tags' };
+      }
+    }
+  }
+
+  // Build normalized tool object matching actual DB structure
   const newTool = {
     name,
-    category: { _id: categoryDoc._id, name: categoryDoc.name },
+    category: categoryName,  // String, not object
+    brand,
+    model,
+    purchaseDate,  // Keep as string (DB stores as string)
     quantity,
-    rack,
-    status,
-    purchaseDate: new Date(purchaseDate),
-    tags: tagDocs
+    location,
+    specifications: effectiveSpecs,  // Array of {name, value, unit} objects
+    maintenance: maintenance || [],
+    tags: tagNames,  // String array
+    status: status || 'available'
   };
+
+  if (description) newTool.description = description;
 
   return { success: true, newTool, error: null };
 }
@@ -66,8 +127,33 @@ async function main() {
   const db = await connect(mongoUri, dbName);
   console.log('Connected DB name:', db.databaseName);
 
+  // require middleware here to avoid circular dependency problems
+  const { verifyToken } = require('./middleware');
+  console.log('verifyToken type:', typeof verifyToken); // should print 'function'
+
   // Basic test route
   app.get('/test', (req, res) => res.json({ message: 'Hello world' }));
+
+  // Helper endpoints for clients to fetch allowed values
+  app.get('/categories', async (req, res) => {
+    try {
+      const categories = await db.collection('categories').distinct('name');
+      res.json({ categories });
+    } catch (err) {
+      console.error('GET /categories error:', err);
+      res.status(500).json({ error: 'Failed to fetch categories' });
+    }
+  });
+
+  app.get('/tags', async (req, res) => {
+    try {
+      const tags = await db.collection('tags').distinct('name');
+      res.json({ tags });
+    } catch (err) {
+      console.error('GET /tags error:', err);
+      res.status(500).json({ error: 'Failed to fetch tags' });
+    }
+  });
 
   // AUTH: register
   app.post('/users', async (req, res) => {
@@ -92,6 +178,8 @@ async function main() {
   app.post('/login', async (req, res) => {
     try {
       const { email, password } = req.body;
+      if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+
       const user = await db.collection('users').findOne({ email });
       if (!user) return res.status(401).json({ error: 'Invalid login' });
 
@@ -109,30 +197,33 @@ async function main() {
   // GET tools (public)
   app.get('/tools', async (req, res) => {
     try {
-      const { name, category, rack, status, tags } = req.query;
+      const { name, category, brand, model, location, status, tags } = req.query;
       const criteria = {};
 
       if (name) criteria['name'] = { $regex: name, $options: 'i' };
-      if (category) criteria['category'] = { $in: category.split(',').map(s => s.trim()) };
-      if (rack) criteria['rack'] = { $in: rack.split(',').map(s => s.trim()) };
+
+      // category stored as string
+      if (category) {
+        const list = category.split(',').map(s => s.trim()).filter(Boolean);
+        if (list.length) criteria['category'] = { $in: list };
+      }
+
+      if (brand) criteria['brand'] = { $in: brand.split(',').map(s => s.trim()) };
+      if (model) criteria['model'] = { $in: model.split(',').map(s => s.trim()) };
+      if (location) criteria['location'] = { $in: location.split(',').map(s => s.trim()) };
       if (status) criteria['status'] = { $in: status.split(',').map(s => s.trim()) };
 
+      // tags stored as string array
       if (tags) {
         const tagList = tags.split(',').map(t => t.trim()).filter(Boolean);
         if (tagList.length) {
           const escape = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
           const regexList = tagList.map(t => new RegExp('^\\s*' + escape(t) + '\\s*$', 'i'));
-          criteria['$or'] = [
-            { tags: { $in: regexList } },        // tags as strings
-            { 'tags.name': { $in: regexList } } // tags as objects
-          ];
+          criteria['tags'] = { $in: regexList };
         }
       }
 
-      const tools = await db.collection('tools').find(criteria).project({
-        name: 1, category: 1, quantity: 1, rack: 1, status: 1, purchaseDate: 1, tags: 1
-      }).toArray();
-
+      const tools = await db.collection('tools').find(criteria).toArray();
       res.json({ tools });
     } catch (error) {
       console.error('GET /tools error:', error);
@@ -143,8 +234,11 @@ async function main() {
   // POST new tool (protected)
   app.post('/tools', verifyToken, async (req, res) => {
     try {
+      console.log('Create tool body:', JSON.stringify(req.body, null, 2));
       const status = await validateTool(db, req.body);
-      if (!status.success) return res.status(400).json({ error: status.error });
+      if (!status.success) {
+        return res.status(400).json(status);
+      }
 
       const result = await db.collection('tools').insertOne(status.newTool);
       res.status(201).json({ message: 'Tool created', toolId: result.insertedId });
@@ -158,16 +252,17 @@ async function main() {
   app.put('/tools/:id', verifyToken, async (req, res) => {
     try {
       const toolId = req.params.id;
+      console.log('Update tool body:', JSON.stringify(req.body, null, 2));
       const status = await validateTool(db, req.body);
-      if (status.success) {
-        await db.collection('tools').updateOne(
-          { _id: new ObjectId(toolId) },
-          { $set: status.newTool }
-        );
-        res.json({ message: 'Tool updated successfully' });
-      } else {
-        res.status(400).json({ error: status.error });
+      if (!status.success) {
+        return res.status(400).json(status);
       }
+
+      await db.collection('tools').updateOne(
+        { _id: new ObjectId(toolId) },
+        { $set: status.newTool }
+      );
+      res.json({ message: 'Tool updated successfully' });
     } catch (error) {
       console.error('PUT /tools/:id error:', error);
       res.status(500).json({ error: 'Failed to update tool' });
@@ -195,23 +290,24 @@ async function main() {
       }
 
       const query = req.query.q || '';
-      // gather available lists for the AI prompt
+      
+      // Gather available lists
       const allCategories = await db.collection('categories').distinct('name');
-      const allRacks = await db.collection('tools').distinct('rack');
+      const allLocations = await db.collection('tools').distinct('location');
       const allStatuses = await db.collection('tools').distinct('status');
 
-      // call the gemini helper
-      const searchParams = await generateSearchParams(query, allCategories, allRacks, allStatuses);
+      // Call gemini helper
+      const searchParams = await generateSearchParams(query, allCategories, allLocations, allStatuses);
       console.log('AI searchParams:', searchParams);
 
       const criteria = {};
 
-      // 1) If AI returned explicit toolNames -> strict match
+      // If AI returned explicit toolNames -> strict match
       if (Array.isArray(searchParams.toolNames) && searchParams.toolNames.length) {
         const escape = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         criteria.name = { $in: searchParams.toolNames.map(t => new RegExp('^\\s*' + escape(t) + '\\s*$', 'i')) };
       } else if (searchParams.requestedParameters && searchParams.requestedParameters.length) {
-        // 2) If user asked for parameters but no toolNames, try best single match by keyword
+        // If user asked for parameters but no toolNames, try best single match by keyword
         const knownTools = await db.collection('tools').distinct('name');
         const qLower = query.toLowerCase();
         const matched = knownTools.find(t => qLower.includes(t.toLowerCase()));
@@ -219,40 +315,39 @@ async function main() {
           const escape = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
           criteria.name = { $regex: '^\\s*' + escape(matched) + '\\s*$', $options: 'i' };
         } else {
-          // no confident match -> return empty result with message
           return res.json({
             tools: [],
             message: 'Request could not be fulfilled'
           });
         }
       } else {
-        // 3) broad intent -> use categories/racks/statuses
-        if (searchParams.categories && searchParams.categories.length) criteria.category = { $in: searchParams.categories };
-        if (searchParams.racks && searchParams.racks.length) criteria.rack = { $in: searchParams.racks };
-        if (searchParams.statuses && searchParams.statuses.length) criteria.status = { $in: searchParams.statuses };
+        // Broad intent -> use categories/locations/statuses
+        if (searchParams.categories && searchParams.categories.length) {
+          criteria['category'] = { $in: searchParams.categories };
+        }
+
+        if (searchParams.locations && searchParams.locations.length) {
+          criteria['location'] = { $in: searchParams.locations };
+        }
+
+        if (searchParams.statuses && searchParams.statuses.length) {
+          criteria['status'] = { $in: searchParams.statuses };
+        }
       }
 
-      // Build projection if requestedParameters present (map common params to fields)
+      // Build projection if requestedParameters present
       const projection = {};
       if (searchParams.requestedParameters && searchParams.requestedParameters.length) {
-        // always include name
         projection.name = 1;
+        projection.specifications = 1;  // Always include specifications for parameter queries
         searchParams.requestedParameters.forEach(p => {
-          const param = p.toLowerCase();
-          if (param === 'model') projection.model = 1;
-          else if (param === 'brand') projection.brand = 1;
-          else if (param === 'specifications' || param === 'weight' || param === 'batterycapacity' || param === 'voltage') {
-            projection.specifications = 1;
-          } else {
-            // default: include specifications so unknown params can be inspected
-            projection.specifications = 1;
-          }
+          if (p === 'model') projection.model = 1;
+          else if (p === 'brand') projection.brand = 1;
         });
       }
 
       const tools = await db.collection('tools').find(criteria).project(Object.keys(projection).length ? projection : {}).toArray();
 
-      // If no match in DB, return empty array with message as requested
       if (!tools || tools.length === 0) {
         return res.json({
           tools: [],
@@ -260,7 +355,17 @@ async function main() {
         });
       }
 
-      // Success
+      // If specific parameters requested, filter specifications array
+      if (searchParams.requestedParameters && searchParams.requestedParameters.length) {
+        tools.forEach(tool => {
+          if (tool.specifications && Array.isArray(tool.specifications)) {
+            tool.specifications = tool.specifications.filter(spec => 
+              searchParams.requestedParameters.includes(spec.name)
+            );
+          }
+        });
+      }
+
       res.json({ tools });
     } catch (error) {
       console.error('GET /ai/tools error:', error);
@@ -275,18 +380,55 @@ async function main() {
         return res.status(503).json({ error: 'AI service not configured' });
       }
 
+      if (!req.body || !req.body.toolText) {
+        return res.status(400).json({ error: 'toolText is required' });
+      }
+
       const toolText = req.body.toolText;
       const allCategories = await db.collection('categories').distinct('name');
       const allStatuses = await db.collection('tools').distinct('status');
 
-      const newTool = await generateTool(toolText, allCategories, allStatuses);
+      let newTool = await generateTool(toolText, allCategories, allStatuses);
 
-      const categoryDoc = await db.collection('categories').findOne({ name: newTool.category });
-      if (!categoryDoc) return res.status(404).json({ error: "AI used a category that doesn't exist" });
+      if (!newTool || !newTool.name) {
+        return res.status(400).json({ error: 'AI did not produce a valid tool' });
+      }
 
-      newTool.category = categoryDoc;
-      const tagDocs = await db.collection('tags').find({ name: { $in: newTool.tags || [] } }).toArray();
-      newTool.tags = tagDocs;
+      // Validate category exists (stored as string)
+      const categoryExists = await db.collection('categories').findOne({ name: newTool.category });
+      if (!categoryExists) {
+        // Auto-create category
+        await db.collection('categories').insertOne({ name: newTool.category, createdAt: new Date() });
+      }
+
+      // Validate and auto-create tags (stored as string array)
+      if (newTool.tags && newTool.tags.length) {
+        const existingTags = await db.collection('tags').find({ name: { $in: newTool.tags } }).toArray();
+        const existingNames = existingTags.map(t => t.name);
+        const toCreate = newTool.tags.filter(n => !existingNames.includes(n));
+        
+        if (toCreate.length) {
+          const inserts = toCreate.map(n => ({ name: n, createdAt: new Date() }));
+          await db.collection('tags').insertMany(inserts, { ordered: false }).catch(err => {
+            if (err.code !== 11000) throw err;
+          });
+        }
+      }
+
+      // Handle field aliases - normalize to 'specifications'
+      if (newTool.specs && !newTool.specifications) {
+        newTool.specifications = newTool.specs;
+        delete newTool.specs;
+      }
+      if (newTool.specification && !newTool.specifications) {
+        newTool.specifications = newTool.specification;
+        delete newTool.specification;
+      }
+
+      // Keep purchaseDate as string (DB stores as string, not Date object)
+      // No conversion needed
+
+      console.log('AI newTool normalized:', JSON.stringify(newTool, null, 2));
 
       const result = await db.collection('tools').insertOne(newTool);
       res.json({ toolId: result.insertedId });
