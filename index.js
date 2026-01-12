@@ -172,7 +172,7 @@ async function main() {
       console.error('POST /users error:', error);
       res.status(500).json({ error: 'Registration failed' });
     }
-  });
+      });
 
   // AUTH: login
   app.post('/login', async (req, res) => {
@@ -296,7 +296,7 @@ async function main() {
       const allLocations = await db.collection('tools').distinct('location');
       const allStatuses = await db.collection('tools').distinct('status');
 
-      // Call gemini helper
+      // Call gemini 
       const searchParams = await generateSearchParams(query, allCategories, allLocations, allStatuses);
       console.log('AI searchParams:', searchParams);
 
