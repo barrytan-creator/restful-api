@@ -134,7 +134,7 @@ async function main() {
   // Basic test route
   app.get('/test', (req, res) => res.json({ message: 'Hello world' }));
 
-  // Helper endpoints for clients to fetch allowed values
+  // endpoints for clients to fetch allowed values
   app.get('/categories', async (req, res) => {
     try {
       const categories = await db.collection('categories').distinct('name');
