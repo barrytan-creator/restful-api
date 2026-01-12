@@ -1,4 +1,4 @@
-// gemini.js
+
 require('dotenv').config(); // read the GEMINI_API_KEY and the GEMINI_MODEL from the .env file
 const { GoogleGenAI } = require('@google/genai');
 

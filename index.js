@@ -23,7 +23,7 @@ app.use(express.json());
 const mongoUri = process.env.MONGO_URI;
 const dbName = process.env.DB_NAME || 'tools_inventory';
 
-// Helper: generate JWT (ensure user id is string)
+// generate JWT (ensure user id is string)
 function generateAccessToken(userId, email) {
   return jwt.sign(
     { user_id: String(userId), email },
